@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -73,7 +74,8 @@ func (py *Python) GenerateRules(args language.GenerateArgs) language.GenerateRes
 	pythonProjectRoot := cfg.PythonProjectRoot()
 
 	packageName := filepath.Base(args.Dir)
-
+	existingPythonRules := map[string]*rule.Rule{}
+	managedPythonFiles := treeset.NewWith(godsutils.StringComparator)
 	pyLibraryFilenames := treeset.NewWith(godsutils.StringComparator)
 	pyTestFilenames := treeset.NewWith(godsutils.StringComparator)
 	pyFileNames := treeset.NewWith(godsutils.StringComparator)
@@ -88,8 +90,29 @@ func (py *Python) GenerateRules(args language.GenerateArgs) language.GenerateRes
 	hasPyTestEntryPointTarget := false
 	hasConftestFile := false
 
+	rulesPythonRuleNames := map[string]bool{
+		cfg.RenderLibraryName(packageName): true,
+		cfg.RenderBinaryName(packageName):  true,
+		cfg.RenderLibraryName(packageName): true,
+	}
+	for _, r := range args.File.Rules {
+		if _, ok := pyKinds[r.Kind()]; !ok {
+			continue
+		}
+		if _, ok := rulesPythonRuleNames[r.Name()]; ok {
+			continue
+		}
+		existingPythonRules[r.Name()] = r
+		for _, src := range r.AttrStrings("srcs") {
+			managedPythonFiles.Add(src)
+		}
+	}
+
 	for _, f := range args.RegularFiles {
 		if cfg.IgnoresFile(filepath.Base(f)) {
+			continue
+		}
+		if managedPythonFiles.Contains(f) {
 			continue
 		}
 		ext := filepath.Ext(f)
@@ -176,6 +199,9 @@ func (py *Python) GenerateRules(args language.GenerateArgs) language.GenerateRes
 									return nil
 								}
 							}
+						}
+						if managedPythonFiles.Contains(srcPath) {
+							return nil
 						}
 						baseName := filepath.Base(path)
 						if strings.HasSuffix(baseName, "_test.py") || strings.HasPrefix(baseName, "test_") {
@@ -377,6 +403,29 @@ func (py *Python) GenerateRules(args language.GenerateArgs) language.GenerateRes
 
 		result.Gen = append(result.Gen, pyTest)
 		result.Imports = append(result.Imports, pyTest.PrivateAttr(config.GazelleImportsKey))
+	}
+
+	for _, r := range existingPythonRules {
+		srcs := treeset.NewWith(godsutils.StringComparator)
+		for _, src := range r.AttrStrings("srcs") {
+			fullPath := path.Join(args.Dir, src)
+			if _, err := os.Stat(fullPath); err != nil {
+				continue
+			}
+			srcs.Add(src)
+		}
+		deps, err := parser.parse(srcs)
+		if err != nil {
+			log.Fatalf("ERROR: %v\n", err)
+		}
+		newRule := newTargetBuilder(r.Kind(), r.Name(), pythonProjectRoot, args.Rel, srcs).
+			addSrcs(srcs).
+			addVisibility(visibility).
+			addModuleDependencies(deps).
+			generateImportsAttribute().
+			build()
+		result.Gen = append(result.Gen, newRule)
+		result.Imports = append(result.Imports, newRule.PrivateAttr(config.GazelleImportsKey))
 	}
 
 	if !collisionErrors.Empty() {
